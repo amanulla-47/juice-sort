@@ -399,7 +399,7 @@ html, body {
   position: absolute;
   left: 50%;
   top: 20%;
-  z-index: 30;
+  z-index: 60;   /* above the dialogs (50-52) and the celebration (40), so messages from them are readable */
   max-width: 80%;
   padding: 10px 18px;
   border-radius: 14px;
@@ -2121,7 +2121,12 @@ class Game extends Phaser.Scene {
       drawWater(b);
     }
     drawLiquidMask();
-    Platform.gameplay(mode === 'play' && !won && $('home').hidden && !overlayOpen());
+    const playable = mode === 'play' && !won && $('home').hidden && !overlayOpen();
+    Platform.gameplay(playable);
+    // A pour can land while a dialog or Home is up, when checkState skips the win / out-of-moves check; look again
+    // as soon as the board is playable, so a finished or dead-ended level is never left hanging.
+    if (playable && !wasPlayable) setTimeout(checkState, 250);
+    wasPlayable = playable;
     updateHand();
     updateFps(time);
     watchPerf(time);
@@ -3220,6 +3225,7 @@ function completeFx(b) {
       em.destroy();
       effects.delete(em);
     });
+    if (!b.corked || !isComplete(b)) return;   // undone or revived during the swirl: no straw on an unfinished glass
 
     // Straw slides down into the finished drink with a springy settle
     b.straw.setVisible(true).setAlpha(0).setRotation(STRAW.rot + 0.12).setPosition(STRAW.x + 0.10 * U, STRAW.y - 0.9 * U);
@@ -3335,7 +3341,7 @@ function setLoopBar(on) {
   bar.hidden = !on;
 }
 // Out of moves: the unsorted glasses give a short shudder so the board itself reacts, then the panel opens.
-let failing = false;
+let failing = false, wasPlayable = false;
 function failNow() {
   deselect();
   failing = true;
@@ -3344,7 +3350,7 @@ function failNow() {
   buzz(40);
   setTimeout(() => {
     failing = false;
-    if (mode === 'play' && !won && !overlayOpen()) showFailed();
+    if (mode === 'play' && !won && !overlayOpen() && !anyMove()) showFailed();   // a booster may have freed the board
   }, 900);
 }
 
@@ -3608,13 +3614,23 @@ const Ads = {
     return r;
   },
   async rewarded(placement) {
-    if (!this.ready()) return false;
+    if (!this.ready() || this.inFlight) return false;   // a second tap while an ad is up does nothing
+    this.inFlight = true;
+    try { return await this.rewardedOnce(placement); } finally { this.inFlight = false; }
+  },
+  async rewardedOnce(placement) {
     let ok;
     if (window.AndroidAds && window.AndroidAds.showRewarded) {
+      const box = $('adbox');   // block the game (Claim, Revive, ...) until the native ad reports back
+      $('adTitle').textContent = 'Loading ad\u2026';
+      $('adSub').textContent = '';
+      $('adCount').hidden = true;
+      box.hidden = false;
       ok = await new Promise(res => {
         window.onRewardedResult = v => { window.onRewardedResult = null; res(!!v); };
         try { window.AndroidAds.showRewarded(placement); } catch (e) { res(false); }
       });
+      box.hidden = true;
     } else if (Platform.hosted()) {
       ok = (await this.sdkAd('rewarded')) === 'finished';
       if (!ok) toast('No ad available right now. Please try again later.');   // no reward without a finished ad
@@ -3706,7 +3722,10 @@ $('buyAd').onclick = () => {
     refreshHUD();
   });
 };
+// A Hint's hand points at one pour; once the board changes without that pour (Undo, Revive, Shuffle) it is stale
+const dropHint = () => { if (tut && tut.hint) hideHint(); };
 function restore(snap) {
+  dropHint();
   bottles.forEach((b, i) => {
     b.units = (snap[i] || []).slice();
     b.hid = Math.min(b.hid, Math.max(0, b.units.length - 1));   // revealed juice stays revealed
@@ -3732,6 +3751,7 @@ $('bShuffle').onclick = () => {
   if (open.length < 2) { toast('Nothing to shuffle'); return; }
   if (!useBoost('shuffle')) return;
   deselect();
+  dropHint();
   history.push(snapshot());
   const pool = shuffleArr(open.flatMap(b => b.units), Math.random);
   let k = 0;
@@ -3770,6 +3790,7 @@ $('bHint').onclick = () => {
   persist();
   refreshHUD();
   tut = { hint: true, src: bottles[mv[0]], dst: bottles[mv[1]] };
+  lockBoosters(true);
   tutStep();
   sfx.tap();
 };
@@ -3812,9 +3833,12 @@ function refreshHUD() {
 /* ---------- Tutorial & Hints ---------- */
 const hand = $('hand'), hint = $('hint');
 function setHint(t) { hint.textContent = t; hint.style.opacity = t ? 1 : 0; }
-function hideHint() { setHint(''); hand.hidden = true; tut = null; }
+// While a Hint's hand is showing, every booster button is disabled (greyed out); they come back when the hint ends
+function lockBoosters(on) { for (const k in BOOSTS) $(BOOSTS[k].id).disabled = on; }
+function hideHint() { setHint(''); hand.hidden = true; tut = null; lockBoosters(false); }
 function setupTutorial() {
   tut = null;
+  lockBoosters(false);
   hand.hidden = true;
   setHint('');
   if (level === 1) {
@@ -3882,8 +3906,7 @@ const modal = $('modal');
 function openSettings() {
   $('tSound').setAttribute('aria-pressed', save.sound);
   $('tVibe').setAttribute('aria-pressed', save.vibrate);
-  $('mRestart').hidden = mode !== 'play';
-  $('mHome').hidden = mode !== 'play';
+  $('mRestart').hidden = $('mHome').hidden = mode !== 'play' || won;   // not while a won level is wrapping up
   modal.hidden = false;
 }
 ['gearBtn', 'gearBtn2'].forEach(id => {
@@ -3905,13 +3928,15 @@ $('tVibe').onclick = () => {
 };
 $('mRestart').onclick = () => {
   modal.hidden = true;
-  if (bottles.some(b => b.busy)) return;
+  if (won) return;
+  if (bottles.some(b => b.busy)) { toast('Wait for the pour to finish'); return; }
   buildLevel(level, true);
 };
-$('mHome').onclick = () => { modal.hidden = true; showHome(); };
+$('mHome').onclick = () => { modal.hidden = true; if (!won) showHome(); };
 // Retry (below Settings): start the level again from its first position
 $('retryBtn').onclick = () => {
-  if (mode !== 'play' || won || overlayOpen() || bottles.some(b => b.busy)) return;
+  if (mode !== 'play' || won || overlayOpen()) return;
+  if (bottles.some(b => b.busy)) { toast('Wait for the pour to finish'); return; }
   sfx.tap();
   buildLevel(level, true);
 };
@@ -4114,7 +4139,7 @@ $('coinsAd').onclick = () => {
 
 // Android back button (MainActivity asks this first): close the top dialog, then go home; on home, exit.
 window.onBack = () => {
-  if (!$('adbox').hidden || mode === 'celebrate') return true;
+  if (!$('adbox').hidden || mode === 'celebrate' || won) return true;   // nothing interrupts an ad or a win
   if (!$('buy').hidden) { closeBuy(); return true; }
   if (!$('coinsBox').hidden) { closeCoins(); return true; }
   if (!$('unlock').hidden) { $('unOk').click(); return true; }
